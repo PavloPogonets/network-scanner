@@ -1,3 +1,9 @@
+## [1.0.1] - 2026-02-17
+
+### Fixed
+- Disabled Google DependencyInfoBlock for F-Droid compliance
+- Hide version code in Release Build
+
 ## [1.0.0] - 2026-02-16
 
 ### Added

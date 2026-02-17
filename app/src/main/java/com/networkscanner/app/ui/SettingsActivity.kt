@@ -122,10 +122,10 @@ class SettingsActivity : AppCompatActivity() {
             findPreference<Preference>("app_version")?.apply {
                 summary = buildString {
                     append(BuildConfig.VERSION_NAME)
-                    append(" (")
-                    append(BuildConfig.VERSION_CODE)
-                    append(")")
                     if (BuildConfig.DEBUG) {
+                        append(" (")
+                        append(BuildConfig.VERSION_CODE)
+                        append(")")
                         append(" - Debug")
                     }
                 }
