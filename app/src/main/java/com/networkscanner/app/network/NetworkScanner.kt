@@ -46,9 +46,13 @@ class NetworkScanner(private val context: Context) {
 
         // Throttle UI updates to avoid flooding
         private const val UI_UPDATE_INTERVAL_MS = 200L
+
+        // Precompiled regex for parsing ping RTT
+        private val PING_RTT_PATTERN = Regex("""time[=<]([\d.]+)\s*ms""")
     }
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scanJob = SupervisorJob()
+    private val scope = CoroutineScope(Dispatchers.IO + scanJob)
     private val discoveredDevices = ConcurrentHashMap<String, Device>()
     private val deviceCache = ConcurrentHashMap<String, Device>()
     private var nsdManager: NsdManager? = null
@@ -73,7 +77,7 @@ class NetworkScanner(private val context: Context) {
     /**
      * Start a full network scan.
      */
-    suspend fun scan(): ScanResult = withContext(Dispatchers.IO) {
+    suspend fun scan(): ScanResult = withContext(scope.coroutineContext) {
         val startTime = Date()
         discoveredDevices.clear()
 
@@ -172,7 +176,7 @@ class NetworkScanner(private val context: Context) {
     suspend fun performDeepScan(
         ipAddress: String,
         ports: List<Int> = CommonPorts.TOP_PORTS
-    ): DeepScanResult = withContext(Dispatchers.IO) {
+    ): DeepScanResult = withContext(scope.coroutineContext) {
         val startTime = System.currentTimeMillis()
         val openPorts = mutableListOf<PortInfo>()
 
@@ -187,11 +191,12 @@ class NetworkScanner(private val context: Context) {
 
             val scannedCount = AtomicInteger(0)
             val foundCount = AtomicInteger(0)
+            val portSemaphore = Semaphore(PORT_THREADS)
 
-            // Scan ports in parallel batches
-            ports.chunked(PORT_THREADS).forEach { chunk ->
-                val results = chunk.map { port ->
-                    async {
+            // Scan all ports in parallel, limited by semaphore
+            val results = ports.map { port ->
+                async {
+                    portSemaphore.withPermit {
                         val isOpen = isPortOpen(ipAddress, port)
                         val count = scannedCount.incrementAndGet()
 
@@ -212,15 +217,15 @@ class NetworkScanner(private val context: Context) {
 
                         if (isOpen) port else null
                     }
-                }.awaitAll().filterNotNull()
+                }
+            }.awaitAll().filterNotNull()
 
-                openPorts.addAll(results.map { port ->
-                    PortInfo(
-                        port = port,
-                        serviceName = CommonPorts.getServiceName(port)
-                    )
-                })
-            }
+            openPorts.addAll(results.map { port ->
+                PortInfo(
+                    port = port,
+                    serviceName = CommonPorts.getServiceName(port)
+                )
+            })
 
             // Phase 2: Banner grabbing for open ports (parallelized)
             if (openPorts.isNotEmpty()) {
@@ -338,21 +343,30 @@ class NetworkScanner(private val context: Context) {
                 socket.connect(InetSocketAddress(ip, port), BANNER_TIMEOUT_MS)
                 socket.soTimeout = BANNER_TIMEOUT_MS
 
-                // For HTTP ports, send a request
-                if (port in listOf(80, 8080, 8000, 8008, 8081, 8888, 443, 8443)) {
-                    socket.getOutputStream().write("HEAD / HTTP/1.0\r\n\r\n".toByteArray())
-                } else if (port == 22) {
-                    // SSH sends banner automatically
-                } else {
-                    // Try to trigger a response
-                    socket.getOutputStream().write("\r\n".toByteArray())
-                }
-
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                 val banner = StringBuilder()
-                var linesRead = 0
 
-                // Use blocking readLine with socket timeout as safeguard
+                // For HTTP ports, send a request to trigger response
+                if (port in listOf(80, 8080, 8000, 8008, 8081, 8888, 443, 8443)) {
+                    socket.getOutputStream().write("HEAD / HTTP/1.0\r\n\r\n".toByteArray())
+                } else {
+                    // For non-HTTP ports, try reading first — many services
+                    // (SSH, FTP, SMTP, etc.) send a banner unprompted.
+                    // Use a short timeout so we don't block long on silent services.
+                    socket.soTimeout = 500
+                    val firstLine = try { reader.readLine() } catch (e: Exception) { null }
+                    if (firstLine != null) {
+                        banner.appendLine(firstLine)
+                    } else {
+                        // Service didn't send anything — nudge it
+                        socket.getOutputStream().write("\r\n".toByteArray())
+                    }
+                    socket.soTimeout = BANNER_TIMEOUT_MS
+                }
+
+                var linesRead = banner.lines().count { it.isNotEmpty() }
+
+                // Read remaining lines
                 while (linesRead < 5) {
                     val line = try {
                         reader.readLine()
@@ -438,43 +452,48 @@ class NetworkScanner(private val context: Context) {
         val portNumbers = openPorts.map { it.port }.toSet()
         val banners = openPorts.mapNotNull { it.banner }.joinToString(" ").lowercase()
 
-        // Windows indicators
+        // Windows indicators — 135/445/3389 are strongly Windows-specific
         val windowsScore = calculateOsScore(
             portNumbers,
             banners,
-            indicatorPorts = setOf(135, 139, 445, 3389, 1433, 5985, 5986),
+            strongPorts = setOf(135, 445, 3389, 1433, 5985, 5986),
+            weakPorts = setOf(139),
             keywords = listOf("windows", "microsoft", "iis", "mssql", "msrpc")
         )
 
-        // Linux indicators
+        // Linux indicators — 111/2049 are strong; 22 is shared with macOS
         val linuxScore = calculateOsScore(
             portNumbers,
             banners,
-            indicatorPorts = setOf(22, 111, 2049),
+            strongPorts = setOf(111, 2049),
+            weakPorts = setOf(22),
             keywords = listOf("linux", "ubuntu", "debian", "centos", "fedora", "openssh", "apache", "nginx")
         )
 
-        // macOS indicators
+        // macOS indicators — 548(AFP)/3283(Apple Remote) are strongly macOS-specific
         val macScore = calculateOsScore(
             portNumbers,
             banners,
-            indicatorPorts = setOf(22, 548, 5900, 3283, 5000),
+            strongPorts = setOf(548, 3283),
+            weakPorts = setOf(22, 5900, 5000),
             keywords = listOf("darwin", "macos", "apple", "airplay", "afp")
         )
 
-        // Router indicators
+        // Router indicators — 161(SNMP)/53(DNS) are strong; 80/443 are shared
         val routerScore = calculateOsScore(
             portNumbers,
             banners,
-            indicatorPorts = setOf(23, 80, 443, 161, 53),
+            strongPorts = setOf(161, 53, 23),
+            weakPorts = setOf(80, 443),
             keywords = listOf("router", "mikrotik", "cisco", "netgear", "asus", "tp-link", "dlink", "ubiquiti")
         )
 
-        // Printer indicators
+        // Printer indicators — 9100(JetDirect)/515(LPD)/631(IPP) are strongly printer-specific
         val printerScore = calculateOsScore(
             portNumbers,
             banners,
-            indicatorPorts = setOf(515, 631, 9100),
+            strongPorts = setOf(515, 631, 9100),
+            weakPorts = emptySet(),
             keywords = listOf("printer", "hp", "epson", "canon", "brother", "cups", "jetdirect")
         )
 
@@ -512,13 +531,15 @@ class NetworkScanner(private val context: Context) {
     private fun calculateOsScore(
         ports: Set<Int>,
         banners: String,
-        indicatorPorts: Set<Int>,
+        strongPorts: Set<Int>,
+        weakPorts: Set<Int>,
         keywords: List<String>
     ): Int {
         var score = 0
-        score += ports.intersect(indicatorPorts).size * 2
+        score += ports.intersect(strongPorts).size * 4
+        score += ports.intersect(weakPorts).size * 1
         keywords.forEach { keyword ->
-            if (banners.contains(keyword)) score += 2
+            if (banners.contains(keyword)) score += 3
         }
         return score
     }
@@ -624,12 +645,14 @@ class NetworkScanner(private val context: Context) {
             val process = Runtime.getRuntime().exec(
                 arrayOf("/system/bin/ping", "-c", "1", "-W", "1", gateway)
             )
-            val startTime = System.currentTimeMillis()
-            val reachable = process.waitFor(2, TimeUnit.SECONDS) && process.exitValue() == 0
+            val output = process.inputStream.bufferedReader().readText()
+            val completed = process.waitFor(2, TimeUnit.SECONDS) && process.exitValue() == 0
             process.destroyForcibly()
 
-            if (reachable) {
-                val latency = (System.currentTimeMillis() - startTime).toInt()
+            if (completed) {
+                val latency = PING_RTT_PATTERN.find(output)
+                    ?.groupValues?.get(1)?.toFloatOrNull()?.toInt()
+                    ?: return@withContext // No real echo reply
                 ArpReader.invalidateCache()
                 val macAddress = ArpReader.getMacForIp(gateway)
                 val vendor = MacVendorLookup.lookup(macAddress)
@@ -660,8 +683,7 @@ class NetworkScanner(private val context: Context) {
 
             val device = existing?.copy(
                 macAddress = entry.normalizedMac,
-                vendor = vendor ?: existing.vendor,
-                discoveredVia = DiscoveryMethod.ARP_CACHE
+                vendor = vendor ?: existing.vendor
             ) ?: Device(
                 ipAddress = entry.ipAddress,
                 macAddress = entry.normalizedMac,
@@ -763,7 +785,7 @@ class NetworkScanner(private val context: Context) {
 
     /**
      * Discover devices via mDNS.
-     * Uses the current coroutineScope for the channel consumer to ensure proper cancellation.
+     * Uses a CountDownLatch-style mechanism to wait for pending resolves before returning.
      */
     private suspend fun discoverMdns() = coroutineScope {
         val serviceTypes = listOf(
@@ -785,6 +807,7 @@ class NetworkScanner(private val context: Context) {
 
         nsdManager = context.getSystemService(Context.NSD_SERVICE) as? NsdManager
 
+        val pendingResolves = AtomicInteger(0)
         val discoveryChannel = Channel<NsdServiceInfo>(Channel.UNLIMITED)
         val listeners = mutableListOf<NsdManager.DiscoveryListener>()
 
@@ -815,7 +838,8 @@ class NetworkScanner(private val context: Context) {
         // Collect discovered services using coroutineScope (not class-level scope)
         val job = launch {
             for (serviceInfo in discoveryChannel) {
-                resolveService(serviceInfo)
+                pendingResolves.incrementAndGet()
+                resolveService(serviceInfo, pendingResolves)
             }
         }
 
@@ -831,32 +855,44 @@ class NetworkScanner(private val context: Context) {
                 // Already stopped
             }
         }
+
+        // Wait briefly for pending resolves to complete (up to 1 second)
+        val resolveDeadline = System.currentTimeMillis() + 1000L
+        while (pendingResolves.get() > 0 && System.currentTimeMillis() < resolveDeadline) {
+            delay(50)
+        }
     }
 
-    private fun resolveService(serviceInfo: NsdServiceInfo) {
+    private fun resolveService(serviceInfo: NsdServiceInfo, pendingResolves: AtomicInteger) {
         nsdManager?.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-            override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {}
+            override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
+                pendingResolves.decrementAndGet()
+            }
 
             override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
-                serviceInfo?.host?.hostAddress?.let { ip ->
-                    val existing = discoveredDevices[ip]
-                    val services = (existing?.mdnsServices ?: emptyList()) + serviceInfo.serviceType
-                    val hostname = serviceInfo.serviceName.takeIf { it.isNotBlank() }
+                try {
+                    serviceInfo?.host?.hostAddress?.let { ip ->
+                        val existing = discoveredDevices[ip]
+                        val services = (existing?.mdnsServices ?: emptyList()) + serviceInfo.serviceType
+                        val hostname = serviceInfo.serviceName.takeIf { it.isNotBlank() }
 
-                    val device = existing?.copy(
-                        hostname = hostname ?: existing.hostname,
-                        mdnsServices = services.distinct(),
-                        discoveredVia = if (existing.discoveredVia == DiscoveryMethod.MANUAL)
-                            existing.discoveredVia else DiscoveryMethod.MDNS
-                    ) ?: Device(
-                        ipAddress = ip,
-                        hostname = hostname,
-                        mdnsServices = services,
-                        isOnline = true,
-                        discoveredVia = DiscoveryMethod.MDNS
-                    )
-                    discoveredDevices[ip] = device
-                    updateDeviceCount()
+                        val device = existing?.copy(
+                            hostname = hostname ?: existing.hostname,
+                            mdnsServices = services.distinct(),
+                            discoveredVia = if (existing.discoveredVia == DiscoveryMethod.MANUAL)
+                                existing.discoveredVia else DiscoveryMethod.MDNS
+                        ) ?: Device(
+                            ipAddress = ip,
+                            hostname = hostname,
+                            mdnsServices = services,
+                            isOnline = true,
+                            discoveredVia = DiscoveryMethod.MDNS
+                        )
+                        discoveredDevices[ip] = device
+                        updateDeviceCount()
+                    }
+                } finally {
+                    pendingResolves.decrementAndGet()
                 }
             }
         })
@@ -1086,7 +1122,7 @@ class NetworkScanner(private val context: Context) {
      * Cancel ongoing scan.
      */
     fun cancel() {
-        scope.coroutineContext.cancelChildren()
+        scanJob.cancelChildren()
     }
 
     /**
