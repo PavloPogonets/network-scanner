@@ -1,0 +1,3 @@
+• Network interface selection — choose which interface to scan on multi-network devices
+• Improved phone and device type detection
+• Fixed scan progress label wording
