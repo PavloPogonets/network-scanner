@@ -155,7 +155,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
            compareBy(
               { !it.isCurrentDevice },
               { !it.isOnline },
-              { it.ipAddress.split('.').fold(0L) { acc, part -> (acc shl 8) or part.toLong() } }
+              {
+                    it.ipAddress
+                        .split('.')
+                        .take(4)
+                        .fold(0L) { acc, part ->
+                            (acc shl 8) or ((part.toLongOrNull() ?: 0L) and 0xFF)
+                        }
+                }
            )
         )
 
