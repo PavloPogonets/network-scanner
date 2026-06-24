@@ -88,6 +88,11 @@ android {
 
     lint {
         disable += "NullSafeMutableLiveData"
+        // Translations are contributed by the community in separate PRs, so a
+        // feature PR may add strings ahead of their translations. Android falls
+        // back to the default (en) string at runtime, so treat incomplete
+        // locales as a warning rather than a build-failing error.
+        warning += "MissingTranslation"
     }
 }
 
